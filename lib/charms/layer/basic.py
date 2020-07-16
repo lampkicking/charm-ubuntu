@@ -2,9 +2,10 @@ import os
 import sys
 import shutil
 from glob import glob
-from subprocess import check_call, CalledProcessError
+from subprocess import check_call, check_output, CalledProcessError
 from time import sleep
 
+from charms import layer
 from charms.layer.execd import execd_preinstall
 
 
@@ -35,9 +36,31 @@ def bootstrap_charm_deps():
     vbin = os.path.join(venv, 'bin')
     vpip = os.path.join(vbin, 'pip')
     vpy = os.path.join(vbin, 'python')
-    if os.path.exists('wheelhouse/.bootstrapped'):
+    hook_name = os.path.basename(sys.argv[0])
+    is_bootstrapped = os.path.exists('wheelhouse/.bootstrapped')
+    is_charm_upgrade = hook_name == 'upgrade-charm'
+    is_series_upgrade = hook_name == 'post-series-upgrade'
+    post_upgrade = os.path.exists('wheelhouse/.upgrade')
+    is_upgrade = not post_upgrade and (is_charm_upgrade or is_series_upgrade)
+    if is_bootstrapped and not is_upgrade:
+        # older subordinates might have downgraded charm-env, so we should
+        # restore it if necessary
+        install_or_update_charm_env()
         activate_venv()
+        # the .upgrade file prevents us from getting stuck in a loop
+        # when re-execing to activate the venv; at this point, we've
+        # activated the venv, so it's safe to clear it
+        if post_upgrade:
+            os.unlink('wheelhouse/.upgrade')
         return
+    if is_series_upgrade and os.path.exists(venv):
+        # series upgrade should do a full clear of the venv, rather than just
+        # updating it, to bring in updates to Python itself
+        shutil.rmtree(venv)
+    if is_upgrade:
+        if os.path.exists('wheelhouse/.bootstrapped'):
+            os.unlink('wheelhouse/.bootstrapped')
+        open('wheelhouse/.upgrade', 'w').close()
     # bootstrap wheelhouse
     if os.path.exists('wheelhouse'):
         with open('/root/.pydistutils.cfg', 'w') as fp:
@@ -53,9 +76,11 @@ def bootstrap_charm_deps():
             'python3-setuptools',
             'python3-yaml',
             'python3-dev',
+            'python3-wheel',
+            'build-essential',
         ])
-        from charms import layer
-        cfg = layer.options('basic')
+        from charms.layer import options
+        cfg = options.get('basic')
         # include packages defined in layer.yaml
         apt_install(cfg.get('packages', []))
         # if we're using a venv, set it up
@@ -82,16 +107,41 @@ def bootstrap_charm_deps():
         # https://github.com/pypa/pip/issues/56
         check_call([pip, 'install', '-U', '--no-index', '-f', 'wheelhouse',
                     'pip'])
+        # per https://github.com/juju-solutions/layer-basic/issues/110
+        # this replaces the setuptools that was copied over from the system on
+        # venv create with latest setuptools and adds setuptools_scm
+        check_call([pip, 'install', '-U', '--no-index', '-f', 'wheelhouse',
+                    'setuptools', 'setuptools-scm'])
         # install the rest of the wheelhouse deps
-        check_call([pip, 'install', '-U', '--no-index', '-f', 'wheelhouse'] +
-                   glob('wheelhouse/*'))
+        check_call([pip, 'install', '-U', '--ignore-installed', '--no-index',
+                   '-f', 'wheelhouse'] + glob('wheelhouse/*'))
+        # re-enable installation from pypi
+        os.remove('/root/.pydistutils.cfg')
+        # install python packages from layer options
+        if cfg.get('python_packages'):
+            check_call([pip, 'install', '-U'] + cfg.get('python_packages'))
         if not cfg.get('use_venv'):
             # restore system pip to prevent `pip3 install -U pip`
             # from changing it
             if os.path.exists('/usr/bin/pip.save'):
                 shutil.copy2('/usr/bin/pip.save', '/usr/bin/pip')
                 os.remove('/usr/bin/pip.save')
-        os.remove('/root/.pydistutils.cfg')
+        # setup wrappers to ensure envs are used for scripts
+        install_or_update_charm_env()
+        for wrapper in ('charms.reactive', 'charms.reactive.sh',
+                        'chlp', 'layer_option'):
+            src = os.path.join('/usr/local/sbin', 'charm-env')
+            dst = os.path.join('/usr/local/sbin', wrapper)
+            if not os.path.exists(dst):
+                os.symlink(src, dst)
+        if cfg.get('use_venv'):
+            shutil.copy2('bin/layer_option', vbin)
+        else:
+            shutil.copy2('bin/layer_option', '/usr/local/bin/')
+        # re-link the charm copy to the wrapper in case charms
+        # call bin/layer_option directly (as was the old pattern)
+        os.remove('bin/layer_option')
+        os.symlink('/usr/local/sbin/layer_option', 'bin/layer_option')
         # flag us as having already bootstrapped so we don't do it again
         open('wheelhouse/.bootstrapped', 'w').close()
         # Ensure that the newly bootstrapped libs are available.
@@ -99,6 +149,30 @@ def bootstrap_charm_deps():
         # Non-namespace-package libs (e.g., charmhelpers) are available
         # without having to reload the interpreter. :/
         reload_interpreter(vpy if cfg.get('use_venv') else sys.argv[0])
+
+
+def install_or_update_charm_env():
+    # On Trusty python3-pkg-resources is not installed
+    try:
+        from pkg_resources import parse_version
+    except ImportError:
+        apt_install(['python3-pkg-resources'])
+        from pkg_resources import parse_version
+
+    try:
+        installed_version = parse_version(
+            check_output(['/usr/local/sbin/charm-env',
+                          '--version']).decode('utf8'))
+    except (CalledProcessError, FileNotFoundError):
+        installed_version = parse_version('0.0.0')
+    try:
+        bundled_version = parse_version(
+            check_output(['bin/charm-env',
+                          '--version']).decode('utf8'))
+    except (CalledProcessError, FileNotFoundError):
+        bundled_version = parse_version('0.0.0')
+    if installed_version < bundled_version:
+        shutil.copy2('bin/charm-env', '/usr/local/sbin/')
 
 
 def activate_venv():
@@ -118,15 +192,17 @@ def activate_venv():
     This will ensure that modules installed in the charm's
     virtual environment are available to the action.
     """
+    from charms.layer import options
     venv = os.path.abspath('../.venv')
     vbin = os.path.join(venv, 'bin')
     vpy = os.path.join(vbin, 'python')
-    from charms import layer
-    cfg = layer.options('basic')
-    if cfg.get('use_venv') and '.venv' not in sys.executable:
+    use_venv = options.get('basic', 'use_venv')
+    if use_venv and '.venv' not in sys.executable:
         # activate the venv
         os.environ['PATH'] = ':'.join([vbin, os.environ['PATH']])
         reload_interpreter(vpy)
+    layer.patch_options_interface()
+    layer.import_layer_libs()
 
 
 def reload_interpreter(python):
@@ -164,6 +240,12 @@ def apt_install(packages):
         except CalledProcessError:
             if attempt == 2:  # third attempt
                 raise
+            try:
+                # sometimes apt-get update needs to be run
+                check_call(['apt-get', 'update'])
+            except CalledProcessError:
+                # sometimes it's a dpkg lock issue
+                pass
             sleep(5)
         else:
             break
@@ -190,7 +272,6 @@ def init_config_states():
         toggle_state('config.set.{}'.format(opt), config.get(opt))
         toggle_state('config.default.{}'.format(opt),
                      config.get(opt) == config_defaults[opt])
-    hookenv.atexit(clear_config_states)
 
 
 def clear_config_states():
